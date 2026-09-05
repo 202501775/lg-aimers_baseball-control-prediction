@@ -1,15 +1,23 @@
 """
 Neural-network training pipeline for pitch-level control prediction.
 
-Main ideas used in the project
-------------------------------
-1. Categorical embeddings for game/context variables
-2. Robust normalization of numerical features
-3. A strong probability prior used as a logit anchor
-4. Multi-task auxiliary targets to improve representation learning
-5. Multi-seed + snapshot ensembling ("NN farm")
+Best-model NN strategy
+----------------------
+1. Categorical embeddings + numerical features
+2. Robust numerical normalization
+3. Season-level success estimate used as a logit anchor
+4. Multi-task auxiliary learning
+5. Multiple random seeds
+6. Late-epoch snapshot ensembling ("NN farm")
 
-This is a cleaned portfolio version of the V7 neural-network pipeline.
+The final V7 NN farm used:
+- 2 auxiliary-task configurations
+- 3 random seeds per configuration
+- 16 late-epoch snapshots per run
+- 96 snapshot members in total
+
+This file is a cleaned portfolio version of the original competition
+training code.
 """
 
 from __future__ import annotations
@@ -26,6 +34,20 @@ from torch.utils.data import DataLoader, TensorDataset
 # Configuration
 # ---------------------------------------------------------------------
 
+EMBEDDING_COLUMNS = [
+    "top_bottom",
+    "game_type",
+    "base_state",
+    "hand_matchup",
+    "count_state",
+    "pitcher_team_id",
+    "batter_team_id",
+    "pitcher_hand",
+    "batter_hand",
+    "inning",
+]
+
+
 @dataclass
 class NNConfig:
     hidden_dim: int = 64
@@ -37,8 +59,6 @@ class NNConfig:
     batch_size: int = 8192
 
     epochs: int = 60
-
-    # Late epochs are saved as snapshot ensemble members.
     snapshot_start: int = 44
 
     auxiliary_weight: float = 0.30
@@ -47,23 +67,47 @@ class NNConfig:
 DEFAULT_SEEDS = [0, 1, 2]
 
 
+AUXILIARY_CONFIGS = {
+    "aux2": {
+        "targets": [
+            "reverse",
+            "middle",
+        ],
+        "weight": 0.30,
+    },
+
+    "aux4": {
+        "targets": [
+            "reverse",
+            "middle",
+            "ball",
+            "strike",
+        ],
+        "weight": 0.30,
+    },
+}
+
+
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
 
 def logit(
     probability: np.ndarray,
-    eps: float = 1e-6,
+    eps: float = 1e-9,
 ) -> np.ndarray:
     """
-    Convert probabilities into logits.
+    Convert probability into log-odds.
 
-    The project used an existing season-level success estimate as an
-    anchor rather than forcing the neural network to learn the entire
-    probability from zero.
+    The neural network predicts a residual correction on top of an
+    existing season-level success estimate rather than learning the
+    entire probability independently.
     """
     p = np.clip(
-        np.asarray(probability, dtype=np.float32),
+        np.asarray(
+            probability,
+            dtype=np.float32,
+        ),
         eps,
         1.0 - eps,
     )
@@ -79,17 +123,21 @@ def embedding_dimensions(
     exponent: float = 0.35,
 ) -> list[int]:
     """
-    Choose compact embedding dimensions from category cardinalities.
+    Determine compact embedding dimensions.
 
-    This keeps small categorical variables inexpensive while allowing
-    larger vocabularies slightly more representation capacity.
+    Equivalent to the dimension rule used in the original V7 NN code.
     """
     return [
         min(
             cap,
             max(
                 2,
-                int(round(cardinality ** exponent)),
+                int(
+                    round(
+                        cardinality
+                        ** exponent
+                    )
+                ),
             ),
         )
         for cardinality in cardinalities
@@ -97,16 +145,21 @@ def embedding_dimensions(
 
 
 # ---------------------------------------------------------------------
-# Numeric preprocessing
+# Numerical preprocessing
 # ---------------------------------------------------------------------
 
 class RobustNumericScaler:
     """
-    Robust numerical preprocessing used before neural-network training.
+    Numerical preprocessing used by the NN pipeline.
 
-    - median imputation
-    - scaling by the 1st–99th percentile range
-    - clipping extreme normalized values
+    Procedure
+    ---------
+    1. Estimate statistics from a random training subset.
+    2. Replace missing values with the median.
+    3. Scale by the 1st-to-99th percentile range.
+    4. Clip normalized values to [-5, 5].
+
+    Statistics must be estimated only from training data.
     """
 
     def __init__(self):
@@ -121,15 +174,19 @@ class RobustNumericScaler:
     ):
         rng = np.random.RandomState(seed)
 
-        n = len(X)
+        n_rows = len(X)
 
-        if n > sample_size:
-            idx = rng.choice(
-                n,
+        if n_rows > sample_size:
+            index = rng.choice(
+                n_rows,
                 sample_size,
                 replace=False,
             )
-            sample = X[np.sort(idx)]
+
+            sample = X[
+                np.sort(index)
+            ]
+
         else:
             sample = X
 
@@ -155,13 +212,18 @@ class RobustNumericScaler:
         self,
         X: np.ndarray,
     ) -> np.ndarray:
-
-        if self.median_ is None or self.range_ is None:
+        """
+        Apply fitted robust normalization.
+        """
+        if (
+            self.median_ is None
+            or self.range_ is None
+        ):
             raise RuntimeError(
-                "Scaler must be fitted before transform()."
+                "Scaler must be fitted first."
             )
 
-        out = np.asarray(
+        out = np.ascontiguousarray(
             X,
             dtype=np.float32,
         ).copy()
@@ -169,8 +231,14 @@ class RobustNumericScaler:
         missing = np.isnan(out)
 
         if missing.any():
-            rows, cols = np.where(missing)
-            out[rows, cols] = self.median_[cols]
+            rows, cols = np.where(
+                missing
+            )
+
+            out[
+                rows,
+                cols,
+            ] = self.median_[cols]
 
         out -= self.median_
         out /= self.range_
@@ -182,72 +250,109 @@ class RobustNumericScaler:
             out=out,
         )
 
-        return np.ascontiguousarray(out)
+        return out
 
 
 # ---------------------------------------------------------------------
-# Multi-task neural network
+# Model
 # ---------------------------------------------------------------------
 
 class MultiTaskMLP(nn.Module):
     """
-    Embedding + numerical-feature MLP.
+    Multi-task MLP used in the V7 NN farm.
 
-    The primary head predicts control_success.
+    Input
+    -----
+    categorical embeddings
+    +
+    normalized numerical features
 
-    Auxiliary heads predict related pitch outcomes such as:
-        - reverse miss
-        - middle miss
-        - ball
-        - strike
+    Output
+    ------
+    primary:
+        residual logit for control_success
 
-    Auxiliary targets are used only during training.
+    auxiliary:
+        logits for related pitch outcomes
+
+    Final primary prediction:
+
+        sigmoid(anchor_logit + residual_logit)
     """
 
     def __init__(
         self,
         cardinalities: list[int],
         n_numeric: int,
-        n_auxiliary: int = 4,
+        n_auxiliary: int,
         hidden_dim: int = 64,
         dropout: float = 0.30,
+        embedding_cap: int = 8,
     ):
         super().__init__()
 
-        dims = embedding_dimensions(
-            cardinalities
+        dimensions = embedding_dimensions(
+            cardinalities,
+            cap=embedding_cap,
         )
 
         self.embeddings = nn.ModuleList(
             [
-                nn.Embedding(cardinality, dim)
-                for cardinality, dim
-                in zip(cardinalities, dims)
+                nn.Embedding(
+                    cardinality,
+                    dimension,
+                )
+                for (
+                    cardinality,
+                    dimension,
+                )
+                in zip(
+                    cardinalities,
+                    dimensions,
+                )
             ]
         )
 
-        input_dim = sum(dims) + n_numeric
+        input_dim = (
+            sum(dimensions)
+            + n_numeric
+        )
 
         self.trunk = nn.Sequential(
-            nn.BatchNorm1d(input_dim),
-            nn.Dropout(dropout),
+
+            nn.BatchNorm1d(
+                input_dim
+            ),
+
+            nn.Dropout(
+                dropout
+            ),
 
             nn.Linear(
                 input_dim,
                 hidden_dim,
             ),
+
             nn.SiLU(),
 
-            nn.BatchNorm1d(hidden_dim),
-            nn.Dropout(dropout),
+            nn.BatchNorm1d(
+                hidden_dim
+            ),
+
+            nn.Dropout(
+                dropout
+            ),
 
             nn.Linear(
                 hidden_dim,
                 hidden_dim // 2,
             ),
+
             nn.SiLU(),
 
-            nn.Dropout(dropout / 2),
+            nn.Dropout(
+                dropout / 2,
+            ),
         )
 
         self.primary_head = nn.Linear(
@@ -260,10 +365,11 @@ class MultiTaskMLP(nn.Module):
             n_auxiliary,
         )
 
-        # Begin near the anchor probability.
+        # Start from the anchor probability.
         nn.init.zeros_(
             self.primary_head.weight
         )
+
         nn.init.zeros_(
             self.primary_head.bias
         )
@@ -272,21 +378,28 @@ class MultiTaskMLP(nn.Module):
         self,
         categorical: torch.Tensor,
         numerical: torch.Tensor,
+        return_auxiliary: bool = False,
     ):
-        embeddings = [
+        embedded = [
             embedding(
-                categorical[:, i]
+                categorical[:, index]
             )
-            for i, embedding
-            in enumerate(self.embeddings)
+
+            for index, embedding
+            in enumerate(
+                self.embeddings
+            )
         ]
 
         x = torch.cat(
-            embeddings + [numerical],
+            embedded
+            + [numerical],
             dim=1,
         )
 
-        representation = self.trunk(x)
+        representation = (
+            self.trunk(x)
+        )
 
         primary_logit = (
             self.primary_head(
@@ -295,23 +408,27 @@ class MultiTaskMLP(nn.Module):
             .squeeze(1)
         )
 
-        auxiliary_logits = (
-            self.auxiliary_head(
-                representation
-            )
-        )
+        if return_auxiliary:
 
-        return (
-            primary_logit,
-            auxiliary_logits,
-        )
+            auxiliary_logits = (
+                self.auxiliary_head(
+                    representation
+                )
+            )
+
+            return (
+                primary_logit,
+                auxiliary_logits,
+            )
+
+        return primary_logit
 
 
 # ---------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------
 
-def train_one_seed(
+def train_one_member(
     categorical: np.ndarray,
     numerical: np.ndarray,
     anchor_probability: np.ndarray,
@@ -319,20 +436,20 @@ def train_one_seed(
     y_auxiliary: np.ndarray,
     cardinalities: list[int],
     seed: int,
-    config: NNConfig | None = None,
+    config: NNConfig,
     device: str | None = None,
 ):
     """
-    Train one multi-task neural-network member.
+    Train one NN run and collect late-epoch snapshots.
 
-    Prediction is modeled as:
+    With the default configuration:
 
-        sigmoid(anchor_logit + neural_network_residual)
+        epochs = 60
+        snapshot_start = 44
 
-    rather than learning the full probability independently.
+    snapshots are collected for epochs 44..59,
+    giving 16 snapshots per run.
     """
-    if config is None:
-        config = NNConfig()
 
     if device is None:
         device = (
@@ -344,30 +461,44 @@ def train_one_seed(
     torch.manual_seed(seed)
 
     categorical_t = torch.from_numpy(
-        categorical.astype(np.int64)
+        categorical.astype(
+            np.int64
+        )
     )
 
     numerical_t = torch.from_numpy(
-        numerical.astype(np.float32)
+        numerical.astype(
+            np.float32
+        )
     )
 
     anchor_t = torch.from_numpy(
-        logit(anchor_probability)
+        logit(
+            np.clip(
+                anchor_probability,
+                0.05,
+                0.95,
+            )
+        )
     )
 
-    primary_t = torch.from_numpy(
-        y_primary.astype(np.float32)
+    target_t = torch.from_numpy(
+        y_primary.astype(
+            np.float32
+        )
     )
 
     auxiliary_t = torch.from_numpy(
-        y_auxiliary.astype(np.float32)
+        y_auxiliary.astype(
+            np.float32
+        )
     )
 
     dataset = TensorDataset(
         categorical_t,
         numerical_t,
         anchor_t,
-        primary_t,
+        target_t,
         auxiliary_t,
     )
 
@@ -392,39 +523,65 @@ def train_one_seed(
         weight_decay=config.weight_decay,
     )
 
-    primary_loss_fn = (
-        nn.BCEWithLogitsLoss()
-    )
-
-    auxiliary_loss_fn = (
+    binary_cross_entropy = (
         nn.BCEWithLogitsLoss()
     )
 
     snapshots = []
 
-    for epoch in range(config.epochs):
+    for epoch in range(
+        config.epochs
+    ):
 
         model.train()
 
         for (
-            cat_batch,
-            num_batch,
+            categorical_batch,
+            numerical_batch,
             anchor_batch,
             target_batch,
-            aux_batch,
+            auxiliary_batch,
         ) in loader:
 
-            cat_batch = cat_batch.to(device)
-            num_batch = num_batch.to(device)
-            anchor_batch = anchor_batch.to(device)
-            target_batch = target_batch.to(device)
-            aux_batch = aux_batch.to(device)
+            categorical_batch = (
+                categorical_batch.to(
+                    device
+                )
+            )
+
+            numerical_batch = (
+                numerical_batch.to(
+                    device
+                )
+            )
+
+            anchor_batch = (
+                anchor_batch.to(
+                    device
+                )
+            )
+
+            target_batch = (
+                target_batch.to(
+                    device
+                )
+            )
+
+            auxiliary_batch = (
+                auxiliary_batch.to(
+                    device
+                )
+            )
 
             optimizer.zero_grad()
 
-            residual_logit, aux_logits = model(
-                cat_batch,
-                num_batch,
+            (
+                residual_logit,
+                auxiliary_logits,
+            ) = model(
+                categorical_batch,
+                numerical_batch,
+                return_auxiliary=True,
             )
 
             final_logit = (
@@ -432,14 +589,18 @@ def train_one_seed(
                 + anchor_batch
             )
 
-            primary_loss = primary_loss_fn(
-                final_logit,
-                target_batch,
+            primary_loss = (
+                binary_cross_entropy(
+                    final_logit,
+                    target_batch,
+                )
             )
 
-            auxiliary_loss = auxiliary_loss_fn(
-                aux_logits,
-                aux_batch,
+            auxiliary_loss = (
+                binary_cross_entropy(
+                    auxiliary_logits,
+                    auxiliary_batch,
+                )
             )
 
             loss = (
@@ -453,12 +614,12 @@ def train_one_seed(
             optimizer.step()
 
         # ---------------------------------------------------------
-        # Snapshot ensemble
+        # Late-epoch snapshot ensemble
         # ---------------------------------------------------------
 
         if epoch >= config.snapshot_start:
 
-            snapshot = {
+            state = {
                 key: value
                 .detach()
                 .cpu()
@@ -466,11 +627,18 @@ def train_one_seed(
 
                 for key, value
                 in model.state_dict().items()
+
+                # Auxiliary heads are not needed at inference time.
+                if not key.startswith(
+                    "auxiliary_head."
+                )
             }
 
-            snapshots.append(snapshot)
+            snapshots.append(
+                state
+            )
 
-    return model, snapshots
+    return snapshots
 
 
 # ---------------------------------------------------------------------
@@ -478,7 +646,7 @@ def train_one_seed(
 # ---------------------------------------------------------------------
 
 @torch.no_grad()
-def predict_model(
+def predict_snapshot(
     model: MultiTaskMLP,
     categorical: np.ndarray,
     numerical: np.ndarray,
@@ -487,7 +655,7 @@ def predict_model(
     device: str | None = None,
 ) -> np.ndarray:
     """
-    Predict control_success probabilities for one NN snapshot.
+    Generate control_success probabilities for one trained snapshot.
     """
     if device is None:
         device = (
@@ -499,46 +667,67 @@ def predict_model(
     model = model.to(device)
     model.eval()
 
-    cat = torch.from_numpy(
-        categorical.astype(np.int64)
+    categorical_t = torch.from_numpy(
+        categorical.astype(
+            np.int64
+        )
     )
 
-    num = torch.from_numpy(
-        numerical.astype(np.float32)
+    numerical_t = torch.from_numpy(
+        numerical.astype(
+            np.float32
+        )
     )
 
-    anchor = torch.from_numpy(
-        logit(anchor_probability)
+    anchor_t = torch.from_numpy(
+        logit(
+            np.clip(
+                anchor_probability,
+                0.05,
+                0.95,
+            )
+        )
     )
 
     predictions = []
 
     for start in range(
         0,
-        len(cat),
+        len(categorical_t),
         batch_size,
     ):
-        end = start + batch_size
 
-        cat_batch = cat[start:end].to(device)
-        num_batch = num[start:end].to(device)
-        anchor_batch = anchor[start:end].to(device)
+        end = (
+            start
+            + batch_size
+        )
 
-        residual_logit, _ = model(
-            cat_batch,
-            num_batch,
+        residual_logit = model(
+            categorical_t[
+                start:end
+            ].to(device),
+
+            numerical_t[
+                start:end
+            ].to(device),
         )
 
         probability = torch.sigmoid(
             residual_logit
-            + anchor_batch
+            + anchor_t[
+                start:end
+            ].to(device)
         )
 
         predictions.append(
-            probability.cpu().numpy()
+            probability
+            .cpu()
+            .numpy()
         )
 
-    return np.concatenate(predictions)
+    return np.concatenate(
+        predictions
+    )
 
 
 # ---------------------------------------------------------------------
@@ -550,37 +739,147 @@ def train_nn_farm(
     numerical: np.ndarray,
     anchor_probability: np.ndarray,
     y_primary: np.ndarray,
-    y_auxiliary: np.ndarray,
+    auxiliary_targets: dict[str, np.ndarray],
     cardinalities: list[int],
     seeds: list[int] = DEFAULT_SEEDS,
-    config: NNConfig | None = None,
 ):
     """
-    Train multiple seeds and collect late-epoch snapshots.
+    Train the V7-style NN farm.
 
-    The competition model averaged predictions across these independent
-    members to reduce variance and improve stability.
+    Default farm
+    ------------
+
+    Configuration 1:
+        reverse + middle auxiliary targets
+
+    Configuration 2:
+        reverse + middle + ball + strike
+
+    For each configuration:
+        3 seeds
+
+    For each run:
+        16 late-epoch snapshots
+
+    Total:
+        2 × 3 × 16 = 96 snapshot members
     """
+
     farm = []
 
-    for seed in seeds:
+    for (
+        configuration_name,
+        auxiliary_config,
+    ) in AUXILIARY_CONFIGS.items():
 
-        _, snapshots = train_one_seed(
-            categorical=categorical,
-            numerical=numerical,
-            anchor_probability=anchor_probability,
-            y_primary=y_primary,
-            y_auxiliary=y_auxiliary,
-            cardinalities=cardinalities,
-            seed=seed,
-            config=config,
+        target_names = (
+            auxiliary_config[
+                "targets"
+            ]
         )
 
-        farm.append(
-            {
-                "seed": seed,
-                "snapshots": snapshots,
-            }
+        auxiliary_matrix = (
+            np.column_stack(
+                [
+                    auxiliary_targets[
+                        name
+                    ]
+                    for name
+                    in target_names
+                ]
+            )
+            .astype(
+                np.float32
+            )
         )
+
+        config = NNConfig(
+            auxiliary_weight=(
+                auxiliary_config[
+                    "weight"
+                ]
+            )
+        )
+
+        for seed in seeds:
+
+            snapshots = (
+                train_one_member(
+                    categorical=(
+                        categorical
+                    ),
+
+                    numerical=(
+                        numerical
+                    ),
+
+                    anchor_probability=(
+                        anchor_probability
+                    ),
+
+                    y_primary=(
+                        y_primary
+                    ),
+
+                    y_auxiliary=(
+                        auxiliary_matrix
+                    ),
+
+                    cardinalities=(
+                        cardinalities
+                    ),
+
+                    seed=seed,
+
+                    config=config,
+                )
+            )
+
+            farm.append(
+                {
+                    "configuration":
+                        configuration_name,
+
+                    "seed":
+                        seed,
+
+                    "targets":
+                        target_names,
+
+                    "snapshots":
+                        snapshots,
+                }
+            )
 
     return farm
+
+
+# ---------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------
+
+def describe_farm(
+    farm: list[dict],
+) -> dict:
+    """
+    Return simple metadata describing the trained ensemble.
+    """
+    n_runs = len(farm)
+
+    n_snapshots = sum(
+        len(
+            member["snapshots"]
+        )
+        for member in farm
+    )
+
+    return {
+        "training_runs":
+            n_runs,
+
+        "snapshot_members":
+            n_snapshots,
+
+        "expected_default_members":
+            96,
+    }
