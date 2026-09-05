@@ -485,10 +485,6 @@ docs/experiment_log.md
 
 The inference pipeline was designed so that each evaluation row depends only on:
 
-The public repository is a cleaned portfolio implementation of the competition
-pipeline. Some competition-specific season-decomposition features and exported
-model artifacts are intentionally not reproduced exactly.
-
 ```text
 current evaluation row
 +
@@ -498,6 +494,10 @@ artifacts derived from training data
 No feature uses statistics calculated from other evaluation rows.
 
 This prevents test-distribution leakage.
+
+The public repository is a cleaned portfolio implementation of the competition
+pipeline. Some competition-specific season-decomposition features and exported
+model artifacts are intentionally not reproduced exactly.
 
 A later deployment experiment also explored portable inference using:
 
