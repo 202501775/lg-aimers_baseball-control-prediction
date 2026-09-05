@@ -1,14 +1,15 @@
 """
-LightGBM training utilities for temporal baseball pitch prediction.
+LightGBM training utilities for pitch-level control prediction.
 
-This module demonstrates the main tree-based modeling strategy used in
-the project:
-
+Main ideas
+----------
 1. Temporal validation by season
 2. Binary control_success prediction
-3. Multiclass auxiliary prediction for miss direction
-4. Multi-seed ensembling
-5. Out-of-fold prediction generation for later ensemble/calibration
+3. Multi-seed LightGBM ensembling
+4. Out-of-fold predictions for ensemble evaluation
+
+This is a cleaned portfolio version of the tree-based pipeline used
+for the project's best-performing V7 ensemble.
 """
 
 from __future__ import annotations
@@ -29,7 +30,13 @@ from sklearn.metrics import log_loss
 
 @dataclass
 class GBDTConfig:
-    objective: str = "binary"
+    """
+    LightGBM configuration used for the binary control-success model.
+
+    The exact competition pipeline contained several model variants.
+    This portfolio version keeps the shared training logic explicit
+    and easy to reproduce.
+    """
 
     learning_rate: float = 0.03
     n_estimators: int = 1200
@@ -52,33 +59,80 @@ DEFAULT_SEEDS = [17, 43, 101, 211]
 
 
 # ---------------------------------------------------------------------
-# Temporal split
+# Temporal validation
 # ---------------------------------------------------------------------
 
 def temporal_split(
     df: pd.DataFrame,
     validation_season: int,
-):
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Create a forward-looking temporal split.
+    Split data chronologically by season.
 
-    Training:
-        seasons strictly before validation_season
+    Training
+    --------
+    All seasons strictly before `validation_season`.
 
-    Validation:
-        validation_season
+    Validation
+    ----------
+    Rows belonging to `validation_season`.
 
-    This avoids random row-level leakage between seasons.
+    Notes
+    -----
+    A random row-level split can leak information across seasons and
+    produce overly optimistic validation results when the evaluation
+    distribution is concentrated in a later season.
+
+    Temporal validation was therefore used to better approximate the
+    competition's hidden-test setting.
     """
-    train_mask = df["season"] < validation_season
-    valid_mask = df["season"] == validation_season
+    train_mask = (
+        df["season"].to_numpy()
+        < validation_season
+    )
+
+    valid_mask = (
+        df["season"].to_numpy()
+        == validation_season
+    )
 
     return train_mask, valid_mask
 
 
 # ---------------------------------------------------------------------
-# Binary LightGBM
+# Single LightGBM model
 # ---------------------------------------------------------------------
+
+def build_binary_model(
+    seed: int,
+    config: GBDTConfig | None = None,
+) -> lgb.LGBMClassifier:
+    """
+    Construct one binary LightGBM classifier.
+    """
+    if config is None:
+        config = GBDTConfig()
+
+    return lgb.LGBMClassifier(
+        objective="binary",
+
+        learning_rate=config.learning_rate,
+        n_estimators=config.n_estimators,
+
+        num_leaves=config.num_leaves,
+        max_depth=config.max_depth,
+        min_child_samples=config.min_child_samples,
+
+        subsample=config.subsample,
+        colsample_bytree=config.colsample_bytree,
+
+        reg_alpha=config.reg_alpha,
+        reg_lambda=config.reg_lambda,
+
+        random_state=seed,
+        n_jobs=config.n_jobs,
+    )
+
 
 def train_binary_model(
     X_train: np.ndarray,
@@ -89,219 +143,227 @@ def train_binary_model(
     config: GBDTConfig | None = None,
 ):
     """
-    Train one binary LightGBM model.
-    """
-    if config is None:
-        config = GBDTConfig()
+    Train one LightGBM model and return validation probabilities.
 
-    model = lgb.LGBMClassifier(
-        objective="binary",
-        learning_rate=config.learning_rate,
-        n_estimators=config.n_estimators,
-        num_leaves=config.num_leaves,
-        max_depth=config.max_depth,
-        min_child_samples=config.min_child_samples,
-        subsample=config.subsample,
-        colsample_bytree=config.colsample_bytree,
-        reg_alpha=config.reg_alpha,
-        reg_lambda=config.reg_lambda,
-        random_state=seed,
-        n_jobs=config.n_jobs,
+    Parameters
+    ----------
+    X_train:
+        Training feature matrix.
+
+    y_train:
+        Binary control_success labels.
+
+    X_valid:
+        Validation feature matrix.
+
+    y_valid:
+        Validation labels.
+
+    seed:
+        Random seed for this ensemble member.
+
+    config:
+        Optional LightGBM configuration.
+
+    Returns
+    -------
+    model:
+        Fitted LightGBM classifier.
+
+    prediction:
+        Probability of control_success for validation rows.
+    """
+    model = build_binary_model(
+        seed=seed,
+        config=config,
     )
 
     model.fit(
         X_train,
         y_train,
-        eval_set=[(X_valid, y_valid)],
+
+        eval_set=[
+            (
+                X_valid,
+                y_valid,
+            )
+        ],
+
+        eval_metric="binary_logloss",
+
         callbacks=[
             lgb.early_stopping(
                 stopping_rounds=100,
                 verbose=False,
             ),
-            lgb.log_evaluation(period=0),
+
+            lgb.log_evaluation(
+                period=0
+            ),
         ],
     )
 
-    pred = model.predict_proba(X_valid)[:, 1]
+    prediction = (
+        model.predict_proba(
+            X_valid
+        )[:, 1]
+        .astype(np.float32)
+    )
 
-    return model, pred
+    return model, prediction
 
 
-def train_binary_seed_ensemble(
+# ---------------------------------------------------------------------
+# Multi-seed ensemble
+# ---------------------------------------------------------------------
+
+def train_seed_ensemble(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_valid: np.ndarray,
     y_valid: np.ndarray,
     seeds: Iterable[int] = DEFAULT_SEEDS,
+    config: GBDTConfig | None = None,
 ):
     """
-    Train several binary models using different random seeds.
+    Train several LightGBM models using different random seeds.
 
-    Averaging multiple seeds reduces model variance while preserving
-    the same feature representation and objective.
+    The individual models use the same target and feature space.
+    Predictions are averaged to reduce variance.
+
+    Returns
+    -------
+    models:
+        List of fitted LightGBM classifiers.
+
+    ensemble_prediction:
+        Mean validation probability across all seeds.
+
+    member_predictions:
+        Matrix with shape:
+            (n_validation_rows, n_models)
     """
     models = []
     predictions = []
 
     for seed in seeds:
-        model, pred = train_binary_model(
-            X_train,
-            y_train,
-            X_valid,
-            y_valid,
+
+        model, prediction = train_binary_model(
+            X_train=X_train,
+            y_train=y_train,
+
+            X_valid=X_valid,
+            y_valid=y_valid,
+
             seed=seed,
+            config=config,
         )
 
         models.append(model)
-        predictions.append(pred)
+        predictions.append(prediction)
 
-    ensemble_pred = np.mean(
-        np.column_stack(predictions),
+    member_predictions = np.column_stack(
+        predictions
+    )
+
+    ensemble_prediction = np.mean(
+        member_predictions,
         axis=1,
-    )
+    ).astype(np.float32)
 
-    return models, ensemble_pred
+    return (
+        models,
+        ensemble_prediction,
+        member_predictions,
+    )
 
 
 # ---------------------------------------------------------------------
-# Multiclass auxiliary target
+# Diagnostics
 # ---------------------------------------------------------------------
 
-MULTICLASS_LABELS = {
-    0: "success",
-    1: "middle_miss",
-    2: "reverse_miss",
-    3: "far_miss",
-}
-
-
-def train_multiclass_model(
-    X_train: np.ndarray,
-    y_train_4class: np.ndarray,
-    X_valid: np.ndarray,
-    y_valid_4class: np.ndarray,
-    seed: int,
-):
+def evaluate_predictions(
+    y_true: np.ndarray,
+    prediction: np.ndarray,
+) -> dict:
     """
-    Train a 4-class auxiliary LightGBM model.
+    Compute simple validation diagnostics.
 
-    Class 0 represents control success.
-    Other classes distinguish different miss directions.
-
-    The final probability used for the main task is the predicted
-    probability of class 0.
+    The competition leaderboard metric is intentionally not reproduced
+    here because this module focuses on the modeling pipeline itself.
     """
-    model = lgb.LGBMClassifier(
-        objective="multiclass",
-        num_class=4,
-
-        learning_rate=0.03,
-        n_estimators=1200,
-
-        num_leaves=31,
-        min_child_samples=100,
-
-        subsample=0.85,
-        colsample_bytree=0.85,
-
-        reg_lambda=2.0,
-
-        random_state=seed,
-        n_jobs=-1,
+    prediction = np.clip(
+        prediction,
+        1e-6,
+        1.0 - 1e-6,
     )
 
-    model.fit(
-        X_train,
-        y_train_4class,
-        eval_set=[
-            (
-                X_valid,
-                y_valid_4class,
+    return {
+        "log_loss": float(
+            log_loss(
+                y_true,
+                prediction,
             )
-        ],
-        callbacks=[
-            lgb.early_stopping(
-                stopping_rounds=100,
-                verbose=False,
-            ),
-            lgb.log_evaluation(period=0),
-        ],
-    )
+        ),
 
-    class_prob = model.predict_proba(X_valid)
+        "prediction_mean": float(
+            np.mean(prediction)
+        ),
 
-    success_prob = class_prob[:, 0]
+        "prediction_std": float(
+            np.std(prediction)
+        ),
 
-    return model, success_prob
-
-
-def train_multiclass_seed_ensemble(
-    X_train: np.ndarray,
-    y_train_4class: np.ndarray,
-    X_valid: np.ndarray,
-    y_valid_4class: np.ndarray,
-    seeds: Iterable[int] = DEFAULT_SEEDS,
-):
-    """
-    Train a multi-seed ensemble for the 4-class auxiliary task.
-    """
-    models = []
-    predictions = []
-
-    for seed in seeds:
-        model, pred = train_multiclass_model(
-            X_train,
-            y_train_4class,
-            X_valid,
-            y_valid_4class,
-            seed,
-        )
-
-        models.append(model)
-        predictions.append(pred)
-
-    ensemble_pred = np.mean(
-        np.column_stack(predictions),
-        axis=1,
-    )
-
-    return models, ensemble_pred
+        "target_mean": float(
+            np.mean(y_true)
+        ),
+    }
 
 
 # ---------------------------------------------------------------------
-# Temporal OOF generation
+# Temporal OOF
 # ---------------------------------------------------------------------
 
 def generate_temporal_oof(
     df: pd.DataFrame,
     X: np.ndarray,
-    y_binary: np.ndarray,
-    y_multiclass: np.ndarray,
-    validation_seasons: list[int],
-):
+    y: np.ndarray,
+    validation_seasons: Iterable[int],
+    seeds: Iterable[int] = DEFAULT_SEEDS,
+    config: GBDTConfig | None = None,
+) -> dict:
     """
     Generate temporal out-of-fold predictions.
 
-    For every validation season:
+    For each validation season:
 
         train = all earlier seasons
         valid = current season
 
-    Both binary and multiclass ensembles are trained independently.
-    """
-    oof_binary = np.full(
-        len(df),
-        np.nan,
-        dtype=np.float32,
-    )
+    This creates predictions that more closely resemble inference on
+    future-season data than a conventional random split.
 
-    oof_multiclass = np.full(
+    Returns
+    -------
+    dict with:
+
+        oof
+            Out-of-fold probability for each row.
+
+        fold_results
+            Season-level validation diagnostics.
+
+        models
+            Fitted models grouped by validation season.
+    """
+    oof = np.full(
         len(df),
         np.nan,
         dtype=np.float32,
     )
 
     fold_results = []
+    fold_models = {}
 
     for season in validation_seasons:
 
@@ -310,87 +372,160 @@ def generate_temporal_oof(
             validation_season=season,
         )
 
-        train_idx = np.where(train_mask)[0]
-        valid_idx = np.where(valid_mask)[0]
+        train_idx = np.flatnonzero(
+            train_mask
+        )
 
-        if len(train_idx) == 0 or len(valid_idx) == 0:
+        valid_idx = np.flatnonzero(
+            valid_mask
+        )
+
+        # Skip impossible folds.
+        if (
+            len(train_idx) == 0
+            or len(valid_idx) == 0
+        ):
             continue
 
         X_train = X[train_idx]
         X_valid = X[valid_idx]
 
-        y_train = y_binary[train_idx]
-        y_valid = y_binary[valid_idx]
+        y_train = y[train_idx]
+        y_valid = y[valid_idx]
 
-        y4_train = y_multiclass[train_idx]
-        y4_valid = y_multiclass[valid_idx]
+        (
+            models,
+            prediction,
+            member_predictions,
+        ) = train_seed_ensemble(
+            X_train=X_train,
+            y_train=y_train,
 
-        # ---------------------------------------------------------
-        # Binary model
-        # ---------------------------------------------------------
+            X_valid=X_valid,
+            y_valid=y_valid,
 
-        _, pred_binary = train_binary_seed_ensemble(
-            X_train,
-            y_train,
-            X_valid,
-            y_valid,
+            seeds=seeds,
+            config=config,
         )
 
-        # ---------------------------------------------------------
-        # Multiclass auxiliary model
-        # ---------------------------------------------------------
+        oof[valid_idx] = prediction
 
-        _, pred_multiclass = train_multiclass_seed_ensemble(
-            X_train,
-            y4_train,
-            X_valid,
-            y4_valid,
+        diagnostics = evaluate_predictions(
+            y_true=y_valid,
+            prediction=prediction,
         )
 
-        oof_binary[valid_idx] = pred_binary
-        oof_multiclass[valid_idx] = pred_multiclass
+        # Prediction diversity between seed members.
+        if member_predictions.shape[1] > 1:
 
-        # ---------------------------------------------------------
-        # Diagnostics
-        # ---------------------------------------------------------
+            corr = np.corrcoef(
+                member_predictions,
+                rowvar=False,
+            )
 
-        binary_logloss = log_loss(
-            y_valid,
-            np.clip(
-                pred_binary,
-                1e-6,
-                1 - 1e-6,
-            ),
-        )
+            upper = corr[
+                np.triu_indices(
+                    corr.shape[0],
+                    k=1,
+                )
+            ]
 
-        multiclass_as_binary_logloss = log_loss(
-            y_valid,
-            np.clip(
-                pred_multiclass,
-                1e-6,
-                1 - 1e-6,
-            ),
-        )
+            mean_seed_correlation = float(
+                np.mean(upper)
+            )
 
-        correlation = np.corrcoef(
-            pred_binary,
-            pred_multiclass,
-        )[0, 1]
+        else:
+            mean_seed_correlation = 1.0
 
         fold_results.append(
             {
-                "season": season,
-                "n_train": len(train_idx),
-                "n_valid": len(valid_idx),
-                "binary_logloss": binary_logloss,
-                "multiclass_success_logloss":
-                    multiclass_as_binary_logloss,
-                "prediction_correlation": correlation,
+                "season": int(season),
+
+                "n_train": int(
+                    len(train_idx)
+                ),
+
+                "n_valid": int(
+                    len(valid_idx)
+                ),
+
+                **diagnostics,
+
+                "mean_seed_correlation":
+                    mean_seed_correlation,
             }
         )
 
+        fold_models[int(season)] = models
+
     return {
-        "binary": oof_binary,
-        "multiclass": oof_multiclass,
-        "fold_results": pd.DataFrame(fold_results),
+        "oof": oof,
+
+        "fold_results": pd.DataFrame(
+            fold_results
+        ),
+
+        "models": fold_models,
     }
+
+
+# ---------------------------------------------------------------------
+# Full-data training
+# ---------------------------------------------------------------------
+
+def train_final_ensemble(
+    X: np.ndarray,
+    y: np.ndarray,
+    seeds: Iterable[int] = DEFAULT_SEEDS,
+    config: GBDTConfig | None = None,
+):
+    """
+    Train the final LightGBM seed ensemble on all available training rows.
+
+    Unlike temporal OOF training, no validation set is used here.
+    Early stopping is therefore disabled and the configured number of
+    boosting rounds is used directly.
+    """
+    if config is None:
+        config = GBDTConfig()
+
+    models = []
+
+    for seed in seeds:
+
+        model = build_binary_model(
+            seed=seed,
+            config=config,
+        )
+
+        model.fit(
+            X,
+            y,
+            callbacks=[
+                lgb.log_evaluation(
+                    period=0
+                )
+            ],
+        )
+
+        models.append(model)
+
+    return models
+
+
+def predict_ensemble(
+    models: list[lgb.LGBMClassifier],
+    X: np.ndarray,
+) -> np.ndarray:
+    """
+    Average probabilities from trained LightGBM ensemble members.
+    """
+    predictions = [
+        model.predict_proba(X)[:, 1]
+        for model in models
+    ]
+
+    return np.mean(
+        np.column_stack(predictions),
+        axis=1,
+    ).astype(np.float32)
