@@ -26,7 +26,7 @@ The main modeling challenges were:
 - temporal distribution shift between seasons
 - unstable historical player statistics for small samples
 - high-dimensional pitcher / batter / count interactions
-- probability calibration
+- stable probability estimation
 - combining complementary model families
 - efficient and reliable inference
 
@@ -212,8 +212,11 @@ Tree-based models performed well because they can naturally capture:
 - player-history interactions
 - game-context effects
 
-Multiple LightGBM variants were ensembled to reduce dependence on a single
-fitted model.
+Multiple LightGBM variants were used in the competition pipeline.
+
+The public portfolio implementation focuses on the shared binary training
+and ensemble logic rather than reproducing every original LightGBM
+configuration exactly.
 
 ```text
 Feature Matrix
@@ -481,6 +484,10 @@ docs/experiment_log.md
 ## 🚀 Inference & Deployment
 
 The inference pipeline was designed so that each evaluation row depends only on:
+
+The public repository is a cleaned portfolio implementation of the competition
+pipeline. Some competition-specific season-decomposition features and exported
+model artifacts are intentionally not reproduced exactly.
 
 ```text
 current evaluation row
