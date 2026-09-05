@@ -378,6 +378,8 @@ P_{\text{final}}
 
 ## 📈 Leaderboard Progress
 
+![Leaderboard Progress](assets/leaderboard_progress.png)
+
 | Version | Main Change | Public LB |
 |---|---|---:|
 | V4 | Early temporal / historical pipeline | ~1087 |
