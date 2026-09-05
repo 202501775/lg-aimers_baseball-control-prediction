@@ -1,143 +1,709 @@
 # ⚾ LG Aimers 9th — Baseball Pitch Control Prediction
 
-> 투구 단위 데이터를 활용하여 투수의 **제구 성공 확률(`control_success`)**을 예측한 머신러닝 프로젝트입니다.
+Pitch-level `control_success` probability prediction using  
+temporal feature engineering, LightGBM, and a multi-task neural-network ensemble.
 
-LG Aimers 9기 데이터 사이언스 프로젝트에서 약 **147만 건의 pitch-level 데이터**를 활용하여  
-각 투구의 제구 성공 확률을 예측하는 모델을 개발했습니다.
+**Best Public LB: 1115.241988**
 
-단순한 모델 성능 향상뿐만 아니라 **시간에 따른 분포 변화(Temporal Distribution Shift)**,
-야구 도메인 기반 Feature Engineering, Empirical Bayes Rating, 모델 앙상블,
-확률 보정 및 제한된 실행 환경에서의 추론 파이프라인까지 전체 ML workflow를 경험했습니다.
+---
+
+## 🏗️ Pipeline Overview
+
+![Model Pipeline](assets/model_pipeline.png)
 
 ---
 
 ## 📌 Project Overview
 
-| Item | Description |
-|---|---|
-| Task | Pitch-level `control_success` probability prediction |
-| Domain | Baseball / Sports Analytics |
-| Training Data | 약 1.47M pitches |
-| Main Metric | Probability prediction score |
-| Main Models | LightGBM, Logistic Regression, Neural Network |
-| Key Methods | Temporal Validation, Empirical Bayes, Trackman Features, Multiclass Learning, Ensemble |
-| Best Public LB | **1115.24** |
+This project predicts the probability that a baseball pitch results in
+`control_success`.
+
+The dataset contains approximately **1.47 million pitch-level observations**
+across multiple seasons.
+
+The main modeling challenges were:
+
+- temporal distribution shift between seasons
+- unstable historical player statistics for small samples
+- high-dimensional pitcher / batter / count interactions
+- probability calibration
+- combining complementary model families
+- efficient and reliable inference
+
+The final best-performing model combined:
+
+- temporal, leakage-safe feature engineering
+- historical pitcher / batter statistics
+- Empirical-Bayes smoothing
+- contextual interaction features
+- LightGBM ensembles
+- anchor-based multi-task neural networks
+- multi-seed and snapshot averaging
+- validation-driven weighted ensembling
 
 ---
 
-## 🎯 Problem
+## 🎯 Task
 
-목표는 각 투구가 주어진 경기 상황에서 **의도한 위치에 성공적으로 제구될 확률**을 예측하는 것입니다.
-
-단순한 이진 분류 문제처럼 보이지만 실제 데이터에서는 다음과 같은 문제가 존재했습니다.
-
-- 투수와 타자의 실력이 시즌에 따라 변화
-- 시즌별 데이터 분포 차이
-- 투수별 표본 수의 큰 차이
-- 경기 상황과 볼카운트에 따른 제구 난이도 변화
-- Trackman 데이터의 부분적인 결측
-- 동일한 실패라도 실패 방향에 따라 서로 다른 패턴 존재
-
-따라서 random split 위주의 검증보다는 **시간 구조와 야구 도메인을 반영한 모델링**이 중요하다고 판단했습니다.
-
----
-
-## 🔍 Validation Strategy
-
-### Temporal Validation
-
-Random K-Fold 대신 시즌을 기준으로 validation을 구성했습니다.
-
-과거 시즌으로 학습하고 미래 시즌을 검증하는 방식으로 실제 leaderboard 환경과 유사한
-**temporal distribution shift**를 반영하고자 했습니다.
-
-이를 통해 단순한 validation score뿐 아니라
-
-- 연도별 일반화 성능
-- 모델 간 prediction correlation
-- 새로운 feature의 안정성
-- calibration 변화
-
-를 함께 확인했습니다.
-
----
-
-## 🛠 Feature Engineering
-
-### 1. Game Context Features
-
-투구 당시의 경기 상황을 표현하는 변수를 생성했습니다.
-
-- Ball / Strike Count
-- Outs
-- Inning
-- Score Difference
-- Base State
-- Pitcher / Batter Handedness
-- Handedness Matchup
-- Count State
-- Pressure / Leverage State
-
----
-
-### 2. Empirical Bayes Ratings
-
-단순 평균은 표본이 적은 선수에게 매우 불안정하다는 문제가 있었습니다.
-
-이를 완화하기 위해 선수 및 경기 상황별 성공률에 **Empirical Bayes Shrinkage**를 적용했습니다.
-
-주요 rating 단위:
-
-- Pitcher
-- Batter
-- Count
-- Handedness Matchup
-- League
-- Pressure State
-- Pitcher × Count
-- Pitcher × Batter Hand
-- Batter × Pitcher Hand
-- Count × Matchup
-- Count × Pressure
-- Higher-order interactions
-
-또한 과거 시즌의 영향력을 점차 감소시키기 위해 **time-decay**를 적용했습니다.
-
----
-
-### 3. Trackman Features
-
-투수의 구종 및 투구 특성을 반영하기 위해 Trackman 기반 정보를 추가했습니다.
-
-예시:
-
-- Fastball usage
-- Breaking ball usage
-- Offspeed usage
-- Pitch-type distribution
-- Pitcher-level pitch characteristics
-
-Trackman 정보가 존재하지 않는 선수도 안정적으로 처리할 수 있도록 missing indicator와
-fallback logic을 함께 구성했습니다.
-
----
-
-## 🤖 Modeling
-
-서로 다른 inductive bias를 가진 모델을 결합하여 prediction diversity를 확보했습니다.
-
-### Gradient Boosting
-
-Binary target을 직접 예측하는 GBDT ensemble을 구성했습니다.
-
-여러 seed의 모델을 학습하여 variance를 감소시켰습니다.
-
-### Multiclass Auxiliary Learning
-
-단순히 성공/실패만 학습하지 않고 투구 결과를
+For every pitch, predict:
 
 ```text
-Success
-Middle-side Miss
-Reverse-side Miss
-Far-side Miss
+P(control_success)
+```
+
+where the output is a probability between 0 and 1.
+
+The goal was not simply to classify whether control succeeded, but to produce
+stable probability estimates that generalize to future-season data.
+
+---
+
+## ⏱️ Validation Strategy
+
+Baseball data is inherently temporal.
+
+Player ability, league environment, pitch usage, and game context can all
+change over time.
+
+Because of this, random train / validation splits were avoided for the main
+experiments.
+
+Instead, validation followed a chronological structure:
+
+```text
+Past seasons
+     │
+     ▼
+Training
+     │
+     ▼
+Future season
+     │
+     ▼
+Validation
+```
+
+Historical features for season `S` were constructed using only information
+available before that season.
+
+Conceptually:
+
+\[
+\text{features}_t
+=
+f(x_t,\mathcal{H}_{<t})
+\]
+
+where:
+
+- \(x_t\) = current pitch context
+- \(\mathcal{H}_{<t}\) = historical information available before prediction
+
+This reduced temporal leakage and made validation more representative of the
+actual competition setting.
+
+---
+
+## 🧩 Feature Engineering
+
+The feature pipeline combines immediate game context with historical player
+information.
+
+### Game Context
+
+Examples include:
+
+- inning
+- top / bottom
+- ball-strike count
+- outs
+- base state
+- score difference
+- leverage / pressure context
+- pitcher and batter handedness
+- home / away context
+
+### Historical Player Features
+
+Historical statistics were constructed for both pitchers and batters.
+
+Examples:
+
+```text
+Pitcher
+├── historical control success
+├── reverse / middle miss rates
+├── ball / strike rates
+├── pitch-mix tendencies
+└── contextual performance
+
+Batter
+├── historical success environment
+├── middle tendencies
+└── contextual matchup history
+```
+
+### Contextual Interactions
+
+The model also uses interaction-level information such as:
+
+```text
+pitcher × batter
+pitcher × count
+pitcher × batter handedness
+pitcher × inning
+pitcher × base state
+batter × count
+batter × pitcher handedness
+```
+
+These features allow the model to represent a matchup rather than treating
+pitcher and batter characteristics independently.
+
+---
+
+## 📊 Empirical-Bayes Smoothing
+
+Raw historical rates can be unreliable when sample sizes are small.
+
+For example:
+
+```text
+Pitcher A
+8 successes / 10 pitches
+
+Pitcher B
+800 successes / 1000 pitches
+```
+
+Both may have the same observed success rate, but their reliability is very
+different.
+
+To stabilize historical estimates, rates were shrunk toward a prior:
+
+\[
+\hat{p}
+=
+\frac{s + kp_0}
+     {n+k}
+\]
+
+where:
+
+- \(s\): observed successes
+- \(n\): number of historical observations
+- \(p_0\): prior probability
+- \(k\): prior strength
+
+This reduces small-sample instability while allowing well-observed players to
+retain their individual characteristics.
+
+---
+
+## 🌲 LightGBM Ensemble
+
+The first model family is a LightGBM ensemble trained on engineered tabular
+features.
+
+Tree-based models performed well because they can naturally capture:
+
+- nonlinear thresholds
+- count-state relationships
+- player-history interactions
+- game-context effects
+
+Multiple LightGBM variants were ensembled to reduce dependence on a single
+fitted model.
+
+```text
+Feature Matrix
+      │
+      ├── LightGBM A
+      ├── LightGBM B
+      ├── LightGBM C
+      └── LightGBM D
+             │
+             ▼
+           P_LGB
+```
+
+---
+
+## 🧠 Neural Network Farm
+
+The second model family combines categorical embeddings with normalized
+numerical features.
+
+Main categorical inputs include:
+
+```text
+top_bottom
+game_type
+base_state
+hand_matchup
+count_state
+pitcher_team_id
+batter_team_id
+pitcher_hand
+batter_hand
+inning
+```
+
+The neural network uses a shared MLP representation and auxiliary pitch-outcome
+tasks during training.
+
+---
+
+## ⚓ Anchor-Based Residual Learning
+
+Rather than predicting the complete probability from scratch, the neural
+network starts from a smoothed historical estimate.
+
+Let:
+
+\[
+p_a
+=
+\text{historical anchor probability}
+\]
+
+The network predicts a residual logit:
+
+\[
+r_\theta = f_\theta(x)
+\]
+
+and the final neural prediction is:
+
+\[
+p
+=
+\sigma
+\left(
+\operatorname{logit}(p_a)
++
+r_\theta
+\right)
+\]
+
+This lets the neural network focus on learning contextual corrections to an
+already meaningful baseball-informed prior.
+
+---
+
+## 🔀 Multi-Task Learning
+
+Two auxiliary-task configurations were used.
+
+### Configuration A
+
+```text
+control_success
+├── reverse
+└── middle
+```
+
+### Configuration B
+
+```text
+control_success
+├── reverse
+├── middle
+├── ball
+└── strike
+```
+
+The training objective was:
+
+\[
+L
+=
+L_{\text{primary}}
++
+0.3L_{\text{aux}}
+\]
+
+The auxiliary heads were used only during training to improve representation
+learning.
+
+---
+
+## 🧺 NN Farm / Snapshot Ensemble
+
+The final V7-style neural ensemble used:
+
+```text
+2 auxiliary configurations
+×
+3 random seeds
+×
+16 late-epoch snapshots
+=
+96 snapshot members
+```
+
+These were **96 snapshots from 6 training runs**, not 96 independently trained
+neural networks.
+
+Snapshot averaging reduced variance and improved prediction stability.
+
+---
+
+## ⚖️ Final Ensemble
+
+Several LightGBM / NN blend ratios were tested.
+
+Two strong configurations were:
+
+| LightGBM | NN Farm | Public LB |
+|---:|---:|---:|
+| 30% | 70% | 1113.9323 |
+| **25%** | **75%** | **1115.2420** |
+
+The best-performing blend was:
+
+\[
+P_{\text{final}}
+=
+0.25P_{\text{LGB}}
++
+0.75P_{\text{NN}}
+\]
+
+### 🏆 Best Public LB
+
+# **1115.241988**
+
+---
+
+## 📈 Leaderboard Progress
+
+| Version | Main Change | Public LB |
+|---|---|---:|
+| V4 | Early temporal / historical pipeline | ~1087 |
+| V6 | Simplified ensemble | ~1091 |
+| V7 | Stronger NN farm | ~1110 |
+| V7 Attack | 30% LGB + 70% NN | 1113.9323 |
+| **V7 Attack** | **25% LGB + 75% NN** | **1115.2420** |
+
+The largest improvements came from combining:
+
+- better temporal validation
+- stronger historical features
+- more stable probability estimates
+- multi-task neural representation learning
+- snapshot / seed ensembling
+- complementary model blending
+
+---
+
+## 🧪 Experiments & Failure Analysis
+
+Several experiments did not become part of the final model.
+
+### DART
+
+A DART-based boosting model was tested for additional diversity.
+
+Its predictions were highly correlated with the existing LightGBM models:
+
+```text
+correlation ≈ 0.96–0.97
+```
+
+Because it added limited independent signal, it was excluded from the final
+ensemble.
+
+### Residual Neural Network
+
+A neural network trained to correct LightGBM residuals underperformed the
+end-to-end anchor-based NN.
+
+Approximate internal validation:
+
+```text
+LightGBM anchor : 878.64
+Residual NN     : 840.80
+V7 end-to-end NN: 932.77
+```
+
+### Recency Weighting
+
+More aggressive down-weighting of older seasons was tested, but validation
+performance degraded.
+
+This suggested that older observations still contained useful signal.
+
+### Probability Sharpening
+
+Logit sharpening with:
+
+```text
+α = 1.12
+```
+
+reduced leaderboard performance rather than improving it.
+
+This reinforced that more confident probabilities are not necessarily better
+calibrated probabilities.
+
+### Four-Class Auxiliary Learning
+
+A four-class target was reconstructed:
+
+```text
+0 → control success
+1 → middle miss
+2 → reverse miss
+3 → far miss
+```
+
+This showed useful signal but did not replace the best V7 pipeline.
+
+### Factorization-Machine Interaction Model
+
+A later experiment explored explicit interaction modeling with Factorization
+Machine-style pairwise features and a dedicated pitcher × batter interaction.
+
+This was a later research direction and **was not part of the 1115.24 best
+leaderboard model**.
+
+More details are available in:
+
+```text
+docs/experiment_log.md
+```
+
+---
+
+## 🚀 Inference & Deployment
+
+The inference pipeline was designed so that each evaluation row depends only on:
+
+```text
+current evaluation row
++
+artifacts derived from training data
+```
+
+No feature uses statistics calculated from other evaluation rows.
+
+This prevents test-distribution leakage.
+
+A later deployment experiment also explored portable inference using:
+
+- NumPy arrays
+- JSON / array-based model artifacts
+- direct tree traversal
+- NumPy neural-network forward passes
+- reduced runtime dependencies
+
+Local numerical equivalence was verified for key exported components.
+
+However, the final hidden-evaluation portable deployment did not complete
+successfully, and the exact failure cause was not conclusively identified.
+
+Therefore, this repository does **not** claim successful production-scale
+deployment of that implementation.
+
+The main engineering lesson was that deployment validation must include:
+
+```text
+numerical correctness
++
+serialization compatibility
++
+runtime
++
+memory usage
++
+full-scale inference testing
+```
+
+---
+
+## 📂 Repository Structure
+
+```text
+.
+├── README.md
+│
+├── src/
+│   ├── feature_engineering.py
+│   ├── train_gbdt.py
+│   ├── train_nn.py
+│   ├── ensemble.py
+│   └── inference.py
+│
+├── docs/
+│   ├── experiment_log.md
+│   └── architecture.md
+│
+├── assets/
+│   ├── model_pipeline.png
+│   └── leaderboard_progress.png
+│
+└── requirements.txt
+```
+
+### Main Files
+
+`src/feature_engineering.py`
+
+- temporal feature generation
+- historical lookup artifacts
+- smoothed player / context features
+- matchup and game-state features
+
+`src/train_gbdt.py`
+
+- temporal LightGBM training utilities
+- seed ensemble
+- validation and OOF logic
+
+`src/train_nn.py`
+
+- anchor-based multi-task MLP
+- categorical embeddings
+- auxiliary learning
+- multi-seed / snapshot NN farm
+
+`src/ensemble.py`
+
+- LightGBM / NN blending
+- final 25% / 75% ensemble
+- blend-search utilities
+
+`src/inference.py`
+
+- model-level inference pipeline
+- prediction validation
+- ensemble prediction
+- submission generation
+
+`docs/experiment_log.md`
+
+- major experiments
+- negative results
+- leaderboard progression
+- deployment lessons
+
+`docs/architecture.md`
+
+- end-to-end modeling architecture
+- feature flow
+- temporal design
+- model interactions
+
+---
+
+## 🛠️ Tech Stack
+
+### Language
+
+- Python
+
+### Data Processing
+
+- NumPy
+- pandas
+
+### Machine Learning
+
+- LightGBM
+- scikit-learn
+
+### Deep Learning
+
+- PyTorch
+
+### Modeling Techniques
+
+- Temporal validation
+- Empirical-Bayes smoothing
+- Gradient boosting
+- Categorical embeddings
+- Multi-task learning
+- Residual logit modeling
+- Snapshot ensembling
+- Weighted model ensembling
+
+---
+
+## 🔒 Data Availability
+
+Competition datasets and large trained model artifacts are **not included** in
+this repository.
+
+The repository focuses on:
+
+- modeling architecture
+- feature-engineering logic
+- training code
+- experiment documentation
+- inference design
+
+This keeps the portfolio reproducible at the code-structure level without
+redistributing competition data.
+
+---
+
+## 💡 Key Takeaways
+
+This project reinforced several lessons.
+
+### Validation design matters as much as model choice
+
+Temporal sports data requires a validation setup that resembles future
+prediction rather than a random split.
+
+### Historical statistics need uncertainty estimates
+
+Raw averages can be misleading for small samples.
+
+Empirical-Bayes smoothing provided a practical way to stabilize them.
+
+### Ensemble diversity matters
+
+A new model is useful only when it provides both strong predictions and
+sufficiently different errors.
+
+### Strong priors can improve neural learning
+
+The historical anchor allowed the NN to learn corrections rather than
+reconstructing player ability entirely from scratch.
+
+### Negative experiments are part of the modeling process
+
+DART, residual learning, aggressive recency weighting, and probability
+sharpening did not become part of the final model, but each helped narrow the
+search space.
+
+### Deployment is a separate ML problem
+
+A model that is numerically correct locally still needs realistic runtime,
+memory, and environment validation before deployment.
+
+---
+
+## 📚 Further Documentation
+
+For detailed experiment history:
+
+```text
+docs/experiment_log.md
+```
+
+For the full modeling architecture:
+
+```text
+docs/architecture.md
+```
+
+---
+
+## 👤 Author
+
+**202501775**
+
+Machine Learning · Sports Analytics · Baseball Data
